@@ -1,64 +1,11 @@
 # Rider Location API
 
-A simple Node.js API where a rider can send their latitude and longitude.
+Riders POST lat/long to the API. Locations are sent to Kafka; a consumer buffers them and bulk-inserts (e.g. to a DB) on an interval or when the buffer is full—so you avoid per-request DB writes.
 
-## Setup
+**Run:** `npm install` then `npm run dev`. API: `http://localhost:3000`.  
+**Kafka:** Start with `docker compose up -d`. Set `KAFKA_BROKERS` if not using default `127.0.0.1:9092`.
 
-```bash
-npm install
-```
+- **POST `/rider/location`** — Body: `{"lat": number, "long": number}`. Returns 201 and enqueues to Kafka.
+- **GET `/health`** — Health check.
 
-## Run
-
-```bash
-npm start
-```
-
-For development with auto-reload:
-
-```bash
-npm run dev
-```
-
-Server runs at `http://localhost:3000` (override with `PORT` env var).
-
-## Endpoints
-
-### POST `/rider/location`
-
-Submit rider's current position.
-
-**Request body (JSON):**
-
-- `lat` / `latitude` — latitude (-90 to 90)
-- `long` / `longitude` — longitude (-180 to 180)
-
-**Example:**
-
-```bash
-curl -X POST http://localhost:3000/rider/location \
-  -H "Content-Type: application/json" \
-  -d '{"lat": 37.7749, "long": -122.4194}'
-```
-
-**Success (201):**
-
-```json
-{
-  "success": true,
-  "message": "Rider location received",
-  "location": {
-    "lat": 37.7749,
-    "long": -122.4194,
-    "receivedAt": "2025-03-01T12:00:00.000Z"
-  }
-}
-```
-
-### GET `/health`
-
-Health check.
-
-```bash
-curl http://localhost:3000/health
-```
+Env: `PORT`, `KAFKA_BROKERS`, `KAFKA_TOPIC_RIDER_LOCATIONS`, `BULK_FLUSH_INTERVAL_MS`, `BULK_FLUSH_MAX_SIZE`.
