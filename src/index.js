@@ -1,5 +1,5 @@
 const express = require("express");
-const { connectProducer, sendRiderLocation, runConsumer } = require("./kafka");
+const { connectProducer, sendRiderLocation, runConsumer, disconnect } = require("./kafka");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -90,3 +90,14 @@ app.listen(PORT, () => {
     }
   })();
 });
+
+function shutdown() {
+  disconnect()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error("Shutdown error:", err);
+      process.exit(1);
+    });
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

@@ -12,6 +12,7 @@ const BROKERS = rawBrokers
 const TOPIC = process.env.KAFKA_TOPIC_RIDER_LOCATIONS || "rider-locations";
 const BULK_FLUSH_INTERVAL_MS =
   Number(process.env.BULK_FLUSH_INTERVAL_MS) || 60_000;
+const BULK_FLUSH_MAX_SIZE = Number(process.env.BULK_FLUSH_MAX_SIZE) || 5000;
 
 const kafka = new Kafka({
   clientId: "rider-location-api",
@@ -46,7 +47,11 @@ async function ensureTopic() {
 
 function getConsumer() {
   if (!consumer) {
-    consumer = kafka.consumer({ groupId: "rider-location-bulk-insert" });
+    consumer = kafka.consumer({
+      groupId: "rider-location-bulk-insert",
+      sessionTimeout: 30_000,
+      rebalanceTimeout: 60_000,
+    });
   }
   return consumer;
 }
@@ -68,46 +73,57 @@ async function sendRiderLocation(location) {
   });
 }
 
-/** Buffer messages; flush every BULK_FLUSH_INTERVAL_MS via setInterval */
+/** Buffer messages; flush every BULK_FLUSH_INTERVAL_MS or when buffer reaches BULK_FLUSH_MAX_SIZE */
 const buffer = [];
 let flushTimer = null;
+let flushing = false;
 
 async function flushBuffer() {
-  if (buffer.length === 0) return;
+  if (buffer.length === 0 || flushing) return;
 
+  flushing = true;
   const batch = buffer.splice(0, buffer.length);
-  const locations = batch.map((e) => {
-    try {
-      return JSON.parse(e.value.toString());
-    } catch {
-      return { raw: e.value.toString() };
-    }
-  });
 
-  console.log(
-    `[BULK INSERT] ${locations.length} rider location(s) at ${new Date().toISOString()}:`,
-    JSON.stringify(locations, null, 2)
-  );
+  try {
+    const locations = batch.map((e) => {
+      try {
+        return JSON.parse(e.value.toString());
+      } catch {
+        return { raw: e.value.toString() };
+      }
+    });
 
-  const c = getConsumer();
-  const maxByPartition = new Map();
-  for (const { topic, partition, offset } of batch) {
-    const key = `${topic}|${partition}`;
-    const num = Number(offset);
-    const cur = maxByPartition.get(key);
-    if (!cur || num > cur.maxOffset) {
-      maxByPartition.set(key, { topic, partition, maxOffset: num });
+    // Replace with your DB bulk insert; on throw we put batch back and don't commit
+    console.log(
+      `[BULK INSERT] ${locations.length} rider location(s) at ${new Date().toISOString()}:`,
+      JSON.stringify(locations, null, 2),
+    );
+
+    const c = getConsumer();
+    const maxByPartition = new Map();
+    for (const { topic, partition, offset } of batch) {
+      const key = `${topic}|${partition}`;
+      const num = Number(offset);
+      const cur = maxByPartition.get(key);
+      if (!cur || num > cur.maxOffset) {
+        maxByPartition.set(key, { topic, partition, maxOffset: num });
+      }
     }
-  }
-  const offsets = Array.from(maxByPartition.values()).map(
-    ({ topic, partition, maxOffset }) => ({
-      topic,
-      partition,
-      offset: String(maxOffset + 1),
-    })
-  );
-  if (offsets.length > 0) {
-    await c.commitOffsets(offsets);
+    const offsets = Array.from(maxByPartition.values()).map(
+      ({ topic, partition, maxOffset }) => ({
+        topic,
+        partition,
+        offset: String(maxOffset + 1),
+      }),
+    );
+    if (offsets.length > 0) {
+      await c.commitOffsets(offsets);
+    }
+  } catch (err) {
+    console.error("[BULK INSERT] error, will retry batch:", err.message || err);
+    buffer.unshift(...batch);
+  } finally {
+    flushing = false;
   }
 }
 
@@ -133,12 +149,15 @@ async function runConsumer() {
         partition,
         offset: message.offset,
       });
+      if (buffer.length >= BULK_FLUSH_MAX_SIZE) {
+        await flushBuffer();
+      }
     },
   });
 
   scheduleFlush();
   console.log(
-    `Kafka consumer subscribed to "${TOPIC}", flushing buffer every ${BULK_FLUSH_INTERVAL_MS / 1000}s.`
+    `Kafka consumer subscribed to "${TOPIC}", flush every ${BULK_FLUSH_INTERVAL_MS / 1000}s or when buffer >= ${BULK_FLUSH_MAX_SIZE}.`,
   );
 }
 
