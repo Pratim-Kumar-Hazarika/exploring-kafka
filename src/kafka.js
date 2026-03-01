@@ -10,6 +10,8 @@ const BROKERS = rawBrokers
   .map((b) => b.trim())
   .map((b) => (b.includes(":") ? b : `${b}:9092`));
 const TOPIC = process.env.KAFKA_TOPIC_RIDER_LOCATIONS || "rider-locations";
+const BULK_FLUSH_INTERVAL_MS =
+  Number(process.env.BULK_FLUSH_INTERVAL_MS) || 60_000;
 
 const kafka = new Kafka({
   clientId: "rider-location-api",
@@ -44,12 +46,7 @@ async function ensureTopic() {
 
 function getConsumer() {
   if (!consumer) {
-    consumer = kafka.consumer({
-      groupId: "rider-location-bulk-insert",
-      maxWaitTimeInMs: 10000, // wait up to 60s to fill a batch
-      // minBytes: 1024 * 1024, // wait until ~1MB of messages is ready
-      // maxBytes: 10 * 1024 * 1024, // max 10MB per batch fetch
-    });
+    consumer = kafka.consumer({ groupId: "rider-location-bulk-insert" });
   }
   return consumer;
 }
@@ -71,6 +68,57 @@ async function sendRiderLocation(location) {
   });
 }
 
+/** Buffer messages; flush every BULK_FLUSH_INTERVAL_MS via setInterval */
+const buffer = [];
+let flushTimer = null;
+
+async function flushBuffer() {
+  if (buffer.length === 0) return;
+
+  const batch = buffer.splice(0, buffer.length);
+  const locations = batch.map((e) => {
+    try {
+      return JSON.parse(e.value.toString());
+    } catch {
+      return { raw: e.value.toString() };
+    }
+  });
+
+  console.log(
+    `[BULK INSERT] ${locations.length} rider location(s) at ${new Date().toISOString()}:`,
+    JSON.stringify(locations, null, 2)
+  );
+
+  const c = getConsumer();
+  const maxByPartition = new Map();
+  for (const { topic, partition, offset } of batch) {
+    const key = `${topic}|${partition}`;
+    const num = Number(offset);
+    const cur = maxByPartition.get(key);
+    if (!cur || num > cur.maxOffset) {
+      maxByPartition.set(key, { topic, partition, maxOffset: num });
+    }
+  }
+  const offsets = Array.from(maxByPartition.values()).map(
+    ({ topic, partition, maxOffset }) => ({
+      topic,
+      partition,
+      offset: String(maxOffset + 1),
+    })
+  );
+  if (offsets.length > 0) {
+    await c.commitOffsets(offsets);
+  }
+}
+
+function scheduleFlush() {
+  if (flushTimer) return;
+  flushTimer = setInterval(async () => {
+    await flushBuffer();
+  }, BULK_FLUSH_INTERVAL_MS);
+  flushTimer.unref?.();
+}
+
 async function runConsumer() {
   const c = getConsumer();
   await c.connect();
@@ -78,57 +126,24 @@ async function runConsumer() {
 
   await c.run({
     autoCommit: false,
-    eachBatchAutoResolve: false,
-
-    eachBatch: async ({
-      batch,
-      resolveOffset,
-      heartbeat,
-      isRunning,
-      isStale,
-    }) => {
-      const { topic, partition, messages } = batch;
-
-      // Parse all messages in the batch
-      const locations = messages.map((msg) => {
-        try {
-          return JSON.parse(msg.value.toString());
-        } catch {
-          return { raw: msg.value.toString() };
-        }
+    eachMessage: async ({ topic, partition, message }) => {
+      buffer.push({
+        value: message.value,
+        topic,
+        partition,
+        offset: message.offset,
       });
-
-      if (locations.length === 0) return;
-
-      // ✅ YOUR BULK INSERT GOES HERE
-      console.log(
-        `[BULK INSERT] ${locations.length} rider location(s) at ${new Date().toISOString()}:`,
-        JSON.stringify(locations, null, 2),
-      );
-
-      // Commit offset of last message after successful insert
-      if (isRunning() && !isStale()) {
-        const lastMessage = messages[messages.length - 1];
-        resolveOffset(lastMessage.offset);
-        await heartbeat();
-
-        await c.commitOffsets([
-          {
-            topic,
-            partition,
-            offset: String(Number(lastMessage.offset) + 1),
-          },
-        ]);
-      }
     },
   });
 
+  scheduleFlush();
   console.log(
-    `Kafka consumer subscribed to "${TOPIC}", using built-in eachBatch.`,
+    `Kafka consumer subscribed to "${TOPIC}", flushing buffer every ${BULK_FLUSH_INTERVAL_MS / 1000}s.`
   );
 }
 
 async function disconnect() {
+  await flushBuffer();
   await producer.disconnect();
   if (consumer) await consumer.disconnect();
 }
